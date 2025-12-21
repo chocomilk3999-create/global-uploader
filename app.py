@@ -64,7 +64,11 @@ async def ensure_not_login(page, market: str):
 
 async def upload_amazon_ui(task: UploadTask) -> str:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # [수정됨] 메모리 절약 모드 적용
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
         context = await browser.new_context(
             storage_state=AMAZON_STATE if os.path.exists(AMAZON_STATE) else None,
             locale="en-US",
@@ -88,7 +92,11 @@ async def upload_amazon_ui(task: UploadTask) -> str:
 
 async def upload_ebay_ui(task: UploadTask) -> str:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # [수정됨] 메모리 절약 모드 적용
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
         context = await browser.new_context(
             storage_state=EBAY_STATE if os.path.exists(EBAY_STATE) else None,
             locale="en-US",
