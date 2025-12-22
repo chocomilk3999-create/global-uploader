@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Page
 
-app = FastAPI(title="Global Auto Uploader (Fixed Debug)")
+app = FastAPI(title="Global Auto Uploader (Final Fix)")
 
 # --- [설정: 디렉토리] ---
 STATE_DIR = "state"
@@ -51,17 +51,13 @@ class UploadResult(BaseModel):
     error_type: Optional[str] = None
     error_message: Optional[str] = None
 
-# --- [중요: 헬퍼 함수를 맨 위로 올림] ---
+# --- [중요: 헬퍼 함수를 맨 위로 올림 - 에러 해결!] ---
 async def save_debug(page, prefix: str):
     """에러 났을 때 화면 스크린샷 찍는 함수"""
     try:
         # 파일명에 특수문자 제거
         safe_prefix = "".join(x for x in prefix if x.isalnum() or x in "_-")
         await page.screenshot(path=os.path.join(DEBUG_DIR, f"{safe_prefix}.png"), full_page=True)
-        # HTML도 저장 (선택)
-        # html = await page.content()
-        # with open(os.path.join(DEBUG_DIR, f"{safe_prefix}.html"), "w", encoding="utf-8") as f:
-        #     f.write(html)
         print(f"Saved debug screenshot: {safe_prefix}.png")
     except Exception as e:
         print(f"Failed to save debug info: {e}")
@@ -81,40 +77,41 @@ def download_image(url: str, prefix: str) -> Optional[str]:
 def classify_retryable(msg: str) -> bool:
     return any(k in msg.lower() for k in ["timeout", "net::", "login", "captcha", "load", "block"])
 
+async def ensure_not_login(page, market_context: str):
+    # 로그인 페이지에 갇혔는지 확인 (가장 중요)
+    url = page.url.lower()
+    if "signin" in url or "login" in url:
+        raise RuntimeError(f"{market_context.upper()}_LOGIN_BLOCK: Bot is stuck at Login Screen.")
+
 # --- [핵심 로직] ---
 async def ebay_fill_form(page: Page, task: UploadTask):
     print(f"Starting to fill form for {task.title}")
     
-    # [1] 로그인 화면인지 먼저 체크 (가장 중요)
-    title_text = await page.title()
-    if "Sign in" in title_text or "Login" in page.url:
-        raise RuntimeError(f"EBAY_LOGIN_BLOCK: Redirected to login page. (Title: {title_text})")
-
-    # [2] 제목 입력 (여러가지 방법으로 시도)
+    # [1] 제목 입력 (여러가지 방법으로 시도)
     try:
         # 방법 A: Label로 찾기
         await page.get_by_label("Title").first.fill(task.title[:80])
     except:
         try:
-            # 방법 B: ID로 찾기 (형님이 찾은 ID의 일부)
+            # 방법 B: 형님이 찾은 ID와 유사한 패턴
             await page.locator("input[id*='TITLE']").first.fill(task.title[:80])
         except:
             # 방법 C: 범용 Selector
             await page.locator('input[name*="title"], input[aria-label*="Title"]').first.fill(task.title[:80])
     
-    # [3] 가격 입력
+    # [2] 가격 입력
     try:
         await page.get_by_label("Price").first.fill(f"{task.price_usd:.2f}")
     except:
         await page.locator('input[name*="price"], input[aria-label*="Price"], input[id*="PRICE"]').first.fill(f"{task.price_usd:.2f}")
     
-    # [4] 수량 입력
+    # [3] 수량 입력
     try:
         await page.get_by_label("Quantity").first.fill(str(task.quantity))
     except:
          await page.locator('input[name*="quantity"], input[aria-label*="Quantity"]').first.fill(str(task.quantity))
 
-    # [5] 설명 (iframe)
+    # [4] 설명 (iframe)
     try:
         iframe = page.locator("iframe").first
         if await iframe.count() > 0:
@@ -148,7 +145,6 @@ async def upload_ebay_ui(task: UploadTask) -> str:
     async with async_playwright() as p:
         market = (task.market or "US").upper()
         conf = EBAY_MARKETS.get(market, EBAY_MARKETS["US"])
-        # state 파일 경로 (쿠키 저장소)
         state_path = os.path.join(STATE_DIR, f"ebay_{market}_state.json")
 
         browser = await p.chromium.launch(
@@ -167,8 +163,9 @@ async def upload_ebay_ui(task: UploadTask) -> str:
             print(f"Navigating to eBay {market}...")
             await page.goto(f"{conf['base']}/sl/sell", timeout=60000)
             
-            # 페이지 로딩 대기
+            # 페이지 로딩 및 로그인 체크
             await page.wait_for_timeout(5000)
+            await ensure_not_login(page, f"ebay_{market}")
 
             # 폼 작성 시작
             await ebay_fill_form(page, task)
@@ -179,7 +176,7 @@ async def upload_ebay_ui(task: UploadTask) -> str:
             return page.url
 
         except Exception as e:
-            # 에러 발생 시 여기서 사진을 찍음
+            # 에러 발생 시 여기서 사진을 찍음 (이제 save_debug가 정의되어 있어서 에러 안 남!)
             await save_debug(page, f"{task.id}_error")
             raise RuntimeError(str(e))
         finally:
