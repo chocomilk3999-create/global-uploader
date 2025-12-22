@@ -5,13 +5,14 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Page
 
-app = FastAPI(title="Global Auto Uploader (Smart Selector)")
+app = FastAPI(title="Global Auto Uploader (Fixed Debug)")
 
 # --- [설정: 디렉토리] ---
 STATE_DIR = "state"
 DEBUG_DIR = "debug"
 TMP_IMG_DIR = "tmp_images"
 
+# 폴더 없으면 만들기
 os.makedirs(STATE_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 os.makedirs(TMP_IMG_DIR, exist_ok=True)
@@ -50,7 +51,21 @@ class UploadResult(BaseModel):
     error_type: Optional[str] = None
     error_message: Optional[str] = None
 
-# --- [헬퍼 함수] ---
+# --- [중요: 헬퍼 함수를 맨 위로 올림] ---
+async def save_debug(page, prefix: str):
+    """에러 났을 때 화면 스크린샷 찍는 함수"""
+    try:
+        # 파일명에 특수문자 제거
+        safe_prefix = "".join(x for x in prefix if x.isalnum() or x in "_-")
+        await page.screenshot(path=os.path.join(DEBUG_DIR, f"{safe_prefix}.png"), full_page=True)
+        # HTML도 저장 (선택)
+        # html = await page.content()
+        # with open(os.path.join(DEBUG_DIR, f"{safe_prefix}.html"), "w", encoding="utf-8") as f:
+        #     f.write(html)
+        print(f"Saved debug screenshot: {safe_prefix}.png")
+    except Exception as e:
+        print(f"Failed to save debug info: {e}")
+
 def download_image(url: str, prefix: str) -> Optional[str]:
     try:
         r = requests.get(url, timeout=30)
@@ -64,52 +79,54 @@ def download_image(url: str, prefix: str) -> Optional[str]:
         return None
 
 def classify_retryable(msg: str) -> bool:
-    return any(k in msg.lower() for k in ["timeout", "net::", "login", "captcha", "load"])
+    return any(k in msg.lower() for k in ["timeout", "net::", "login", "captcha", "load", "block"])
 
-async def ensure_not_login(page):
-    # 로그인 페이지에 갇혔는지 확인 (가장 중요)
-    if "signin" in page.url or "login" in page.url:
-        raise RuntimeError("EBAY_LOGIN_BLOCK: Bot is stuck at Login Screen.")
-
-def get_ebay_state_path(market: str) -> str:
-    return os.path.join(STATE_DIR, f"ebay_{market.upper()}_state.json")
-
-# --- [핵심: 스마트 셀렉터 로직] ---
+# --- [핵심 로직] ---
 async def ebay_fill_form(page: Page, task: UploadTask):
-    # 1. 제목 (Title) - ID 대신 '라벨'이나 'placeholder'로 찾기
-    # eBay 화면마다 달라서 여러 방법으로 시도
+    print(f"Starting to fill form for {task.title}")
+    
+    # [1] 로그인 화면인지 먼저 체크 (가장 중요)
+    title_text = await page.title()
+    if "Sign in" in title_text or "Login" in page.url:
+        raise RuntimeError(f"EBAY_LOGIN_BLOCK: Redirected to login page. (Title: {title_text})")
+
+    # [2] 제목 입력 (여러가지 방법으로 시도)
     try:
+        # 방법 A: Label로 찾기
         await page.get_by_label("Title").first.fill(task.title[:80])
     except:
-        # 실패하면 'Title'이라는 글자 근처의 입력칸 찾기
-        await page.locator('input[name*="title"], input[aria-label*="Title"]').first.fill(task.title[:80])
+        try:
+            # 방법 B: ID로 찾기 (형님이 찾은 ID의 일부)
+            await page.locator("input[id*='TITLE']").first.fill(task.title[:80])
+        except:
+            # 방법 C: 범용 Selector
+            await page.locator('input[name*="title"], input[aria-label*="Title"]').first.fill(task.title[:80])
     
-    # 2. 가격 (Price)
+    # [3] 가격 입력
     try:
         await page.get_by_label("Price").first.fill(f"{task.price_usd:.2f}")
     except:
-        await page.locator('input[name*="price"], input[aria-label*="Price"]').first.fill(f"{task.price_usd:.2f}")
+        await page.locator('input[name*="price"], input[aria-label*="Price"], input[id*="PRICE"]').first.fill(f"{task.price_usd:.2f}")
     
-    # 3. 수량 (Quantity)
+    # [4] 수량 입력
     try:
         await page.get_by_label("Quantity").first.fill(str(task.quantity))
     except:
          await page.locator('input[name*="quantity"], input[aria-label*="Quantity"]').first.fill(str(task.quantity))
 
-    # 4. 설명 (Description) - iframe 찾기
-    # ID가 바뀌어도 'iframe' 태그는 변하지 않음
+    # [5] 설명 (iframe)
     try:
-        iframe = page.locator("iframe").first # 첫번째 iframe이 보통 에디터임
-        await iframe.wait_for(timeout=5000)
-        frame_ctx = iframe.content_frame
-        if frame_ctx:
-            await frame_ctx.locator("body").click()
-            await page.keyboard.press("Control+A")
-            await page.keyboard.press("Backspace")
-            safe_html = task.description_html.replace("`", "\`")
-            await frame_ctx.locator("body").evaluate(f"el => el.innerHTML = `{safe_html}`")
-    except:
-        print("Description iframe skipping (Test mode)")
+        iframe = page.locator("iframe").first
+        if await iframe.count() > 0:
+            frame_ctx = iframe.content_frame
+            if frame_ctx:
+                await frame_ctx.locator("body").click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                safe_html = task.description_html.replace("`", "\`")
+                await frame_ctx.locator("body").evaluate(f"el => el.innerHTML = `{safe_html}`")
+    except Exception as e:
+        print(f"Description skip warning: {e}")
 
 async def ebay_upload_images_logic(page: Page, image_urls: list[str], task_id: str):
     if not image_urls: return
@@ -119,15 +136,20 @@ async def ebay_upload_images_logic(page: Page, image_urls: list[str], task_id: s
         if fp: local_files.append(fp)
     
     if local_files:
-        # 파일 업로드 버튼도 'type=file'로 찾음 (ID 불필요)
-        await page.locator('input[type="file"]').first.set_input_files(local_files)
-        await page.wait_for_timeout(5000)
+        try:
+            # 파일 업로드 버튼 찾기
+            await page.locator('input[type="file"]').first.set_input_files(local_files)
+            # 업로드 대기
+            await page.wait_for_timeout(5000)
+        except:
+            print("Image upload failed (selector not found)")
 
 async def upload_ebay_ui(task: UploadTask) -> str:
     async with async_playwright() as p:
         market = (task.market or "US").upper()
         conf = EBAY_MARKETS.get(market, EBAY_MARKETS["US"])
-        state_path = get_ebay_state_path(market)
+        # state 파일 경로 (쿠키 저장소)
+        state_path = os.path.join(STATE_DIR, f"ebay_{market}_state.json")
 
         browser = await p.chromium.launch(
             headless=True,
@@ -136,25 +158,28 @@ async def upload_ebay_ui(task: UploadTask) -> str:
         context = await browser.new_context(
             storage_state=state_path if os.path.exists(state_path) else None,
             locale=conf["locale"],
-            timezone_id=conf["tz"]
+            timezone_id=conf["tz"],
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
         try:
+            print(f"Navigating to eBay {market}...")
             await page.goto(f"{conf['base']}/sl/sell", timeout=60000)
-            await ensure_not_login(page) # 로그인 체크
-            await page.wait_for_timeout(4000)
+            
+            # 페이지 로딩 대기
+            await page.wait_for_timeout(5000)
 
-            # 스마트 입력 시작
+            # 폼 작성 시작
             await ebay_fill_form(page, task)
             await ebay_upload_images_logic(page, task.images, task.id)
             
-            # 테스트 완료 후 저장
+            # 성공 시 세션 저장
             await context.storage_state(path=state_path)
             return page.url
 
         except Exception as e:
-            # 디버그용 스크린샷 저장
+            # 에러 발생 시 여기서 사진을 찍음
             await save_debug(page, f"{task.id}_error")
             raise RuntimeError(str(e))
         finally:
@@ -168,4 +193,5 @@ async def upload_global(task: UploadTask):
             ebay_url = await upload_ebay_ui(task)
         return UploadResult(success=True, retryable=False, ebay_listing_url=ebay_url)
     except RuntimeError as e:
-        return UploadResult(success=False, retryable=classify_retryable(str(e)), error_message=str(e))
+        msg = str(e)
+        return UploadResult(success=False, retryable=classify_retryable(msg), error_message=msg)
