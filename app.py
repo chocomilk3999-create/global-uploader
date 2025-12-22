@@ -1,11 +1,11 @@
-import os, json, random, requests
+import os, json, random, requests, asyncio
 from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Page
 
-app = FastAPI(title="Global Auto Uploader (Cookie Receiver)")
+app = FastAPI(title="Global Auto Uploader (Final + Ping)")
 
 # --- [설정: 디렉토리] ---
 STATE_DIR = "state"
@@ -43,17 +43,17 @@ class UploadResult(BaseModel):
     ebay_listing_url: Optional[str] = None
     error_message: Optional[str] = None
 
-# ✅ [신규 추가] 쿠키(State) 업데이트용 모델
 class StateUpdate(BaseModel):
     market: str = "US"
-    state_json: Dict[str, Any] # Playwright 전체 state 데이터
+    state_json: Dict[str, Any]
 
 # --- [헬퍼 함수] ---
 async def save_debug(page, prefix: str):
     try:
         safe_prefix = "".join(x for x in prefix if x.isalnum() or x in "_-")
-        await page.screenshot(path=os.path.join(DEBUG_DIR, f"{safe_prefix}.png"), full_page=True)
-        print(f"Saved debug screenshot: {safe_prefix}.png")
+        path = os.path.join(DEBUG_DIR, f"{safe_prefix}.png")
+        await page.screenshot(path=path, full_page=True)
+        print(f"Saved debug screenshot: {path}")
     except: pass
 
 def download_image(url: str, prefix: str) -> Optional[str]:
@@ -68,31 +68,33 @@ def download_image(url: str, prefix: str) -> Optional[str]:
     except: return None
 
 async def ensure_not_login(page, market_context: str):
+    # 로그인 페이지 감지
     url = page.url.lower()
-    if "signin" in url or "login" in url:
+    title = await page.title()
+    if "signin" in url or "login" in url or "Sign in" in title:
         raise RuntimeError(f"{market_context.upper()}_LOGIN_BLOCK")
 
 # --- [핵심 로직] ---
 async def ebay_fill_form(page: Page, task: UploadTask):
-    # 1. 제목
+    # 제목 입력
     try:
         await page.get_by_label("Title").first.fill(task.title[:80])
     except:
         await page.locator('input[name*="title"], input[aria-label*="Title"]').first.fill(task.title[:80])
     
-    # 2. 가격
+    # 가격 입력
     try:
         await page.get_by_label("Price").first.fill(f"{task.price_usd:.2f}")
     except:
         await page.locator('input[name*="price"], input[aria-label*="Price"]').first.fill(f"{task.price_usd:.2f}")
     
-    # 3. 수량
+    # 수량 입력
     try:
         await page.get_by_label("Quantity").first.fill(str(task.quantity))
     except:
          await page.locator('input[name*="quantity"]').first.fill(str(task.quantity))
 
-    # 4. 설명 (iframe)
+    # 설명 (iframe)
     try:
         iframe = page.locator("iframe").first
         if await iframe.count() > 0:
@@ -125,7 +127,7 @@ async def upload_ebay_ui(task: UploadTask) -> str:
 
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         
-        # 저장된 쿠키(State)가 있으면 불러오기
+        # 쿠키 로드
         context = await browser.new_context(
             storage_state=state_path if os.path.exists(state_path) else None,
             locale=conf["locale"],
@@ -135,14 +137,17 @@ async def upload_ebay_ui(task: UploadTask) -> str:
         page = await context.new_page()
 
         try:
+            # 판매 페이지 접속
             await page.goto(f"{conf['base']}/sl/sell", timeout=60000)
             await page.wait_for_timeout(5000)
+            
+            # 로그인 체크
             await ensure_not_login(page, f"ebay_{market}")
 
             await ebay_fill_form(page, task)
             await ebay_upload_images_logic(page, task.images, task.id)
             
-            # 성공하면 최신 쿠키 저장
+            # 성공 시 최신 쿠키 저장
             await context.storage_state(path=state_path)
             return page.url
 
@@ -152,17 +157,19 @@ async def upload_ebay_ui(task: UploadTask) -> str:
         finally:
             await browser.close()
 
-# ✅ [신규 API] 외부에서 쿠키 넣어주는 곳
+# --- [API 엔드포인트] ---
+
+# 1. 쿠키 업데이트 (기존 유지)
 @app.post("/update-state")
 async def update_state(payload: StateUpdate):
     market = payload.market.upper()
     path = os.path.join(STATE_DIR, f"ebay_{market}_state.json")
-    
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload.state_json, f)
-        
+    print(f"✅ Saved state for market={market}")
     return {"status": "success", "message": f"Cookie injected for {market}"}
 
+# 2. 업로드 (기존 유지)
 @app.post("/upload-global", response_model=UploadResult)
 async def upload_global(task: UploadTask):
     try:
@@ -172,3 +179,43 @@ async def upload_global(task: UploadTask):
         return UploadResult(success=True, retryable=False, ebay_listing_url=ebay_url)
     except RuntimeError as e:
         return UploadResult(success=False, retryable=True, error_message=str(e))
+
+# 3. 🔥 [신규] 로그인 상태 확인 (Ping Test)
+@app.get("/ping-ebay")
+async def ping_ebay(market: str = "US"):
+    market = market.upper()
+    conf = EBAY_MARKETS.get(market, EBAY_MARKETS["US"])
+    state_path = os.path.join(STATE_DIR, f"ebay_{market}_state.json")
+    
+    if not os.path.exists(state_path):
+        return {"status": "error", "message": "No cookie file found. Run cookie_shooter first."}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context(
+            storage_state=state_path,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        try:
+            # 셀러 허브 메인으로 접속해봄
+            target_url = "https://www.ebay.com/sh/ovw"
+            print(f"Pinging {target_url}...")
+            await page.goto(target_url, timeout=30000)
+            await page.wait_for_timeout(3000)
+            
+            # 제목에 'Sign in'이나 URL에 'login'이 있는지 체크
+            title = await page.title()
+            url = page.url
+            
+            if "signin" in url.lower() or "login" in url.lower() or "Sign in" in title:
+                # 스크린샷 저장
+                await save_debug(page, "ping_failed")
+                return {"status": "failed", "message": "Login required (Cookie expired or invalid)", "current_url": url}
+            
+            return {"status": "authenticated", "message": "Login successful!", "title": title}
+            
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+        finally:
+            await browser.close()
