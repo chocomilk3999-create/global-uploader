@@ -1,69 +1,95 @@
 import os
+import time
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # 데이터 저장소 (메모리)
-JOB_QUEUE = []
-JOB_RESULTS = {}
-COOKIES_STORE = {}
+JOB_QUEUE = []        # 대기 중인 일감
+JOB_RESULTS = {}      # 완료된 일감 결과
+COOKIES_STORE = {}    # 쿠키 저장소
 
 @app.route('/')
 def home():
-    return f"Use /upload-global to enqueue jobs. Current Queue: {len(JOB_QUEUE)}"
+    return f"Empire Server Running. Jobs in Queue: {len(JOB_QUEUE)}"
 
-# 1. Make에서 일감 던지는 곳
-@app.route('/upload-global', methods=['POST'])
-def enqueue_job():
+# ==========================================
+# ✅ [NEW] 신형 에이전트용 (/jobs)
+# ==========================================
+
+# 1. Make에서 일감 던지기 (POST /jobs/add)
+@app.route('/jobs/add', methods=['POST'])
+def add_job():
     data = request.json
-    job_id = data.get("id") or str(len(JOB_QUEUE) + 1)
+    job_id = data.get("id") or str(int(time.time()))
     
     job = {
-        "job_id": job_id,
-        "market_title": data.get("title"),
-        "market_description_html": data.get("description_html"),
-        "photo_urls": data.get("images", []),
-        "price_usd": data.get("price_usd"),
-        "status": "QUEUED"
+        "id": job_id,
+        "title": data.get("title"),
+        "description_html": data.get("description_html"),
+        "photos": data.get("images", []),
+        "price": data.get("price_usd"),
+        "qty": data.get("qty", 1),
+        "status": "QUEUED",
+        "created_at": time.time()
     }
     JOB_QUEUE.append(job)
-    print(f"📥 [Job Queued] ID: {job_id}")
-    return jsonify({"status": "QUEUED", "job_id": job_id})
+    print(f"📥 [New Job] ID: {job_id}")
+    return jsonify({"ok": True, "job_id": job_id})
 
-# 2. 에이전트가 일감 가져가는 곳
-@app.route('/queue/next', methods=['GET'])
+# 2. 에이전트가 일감 가져가기 (GET /jobs/next)
+@app.route('/jobs/next', methods=['GET'])
 def get_next_job():
-    market = request.args.get('market')
     if not JOB_QUEUE:
-        return '', 204
+        return jsonify({"ok": True, "job": None})
+    
+    # FIFO: 가장 먼저 들어온 일감 꺼내기
     job = JOB_QUEUE.pop(0)
-    return jsonify(job)
+    return jsonify({"ok": True, "job": job})
 
-# 3. 결과 보고
-@app.route('/queue/report', methods=['POST'])
+# 3. 에이전트가 결과 보고하기 (POST /jobs/report)
+@app.route('/jobs/report', methods=['POST'])
 def report_job():
     data = request.json
     job_id = data.get("job_id")
-    print(f"✅ [Report] {job_id} : {data.get('status')}")
+    status = data.get("status")
+    
+    print(f"✅ [Report] {job_id} : {status}")
     JOB_RESULTS[job_id] = data
-    return jsonify({"status": "OK"})
+    return jsonify({"ok": True})
 
-# 4. 쿠키 저장 (POST)
+# ==========================================
+# ⚠️ [LEGACY] 구형 에이전트 호환용 (유지)
+# ==========================================
+@app.route('/upload-global', methods=['POST'])
+def legacy_enqueue():
+    return add_job() # 신형 로직으로 토스
+
+@app.route('/queue/next', methods=['GET'])
+def legacy_next():
+    if not JOB_QUEUE: return '', 204
+    job = JOB_QUEUE.pop(0)
+    # 구형 포맷으로 변환
+    return jsonify({
+        "job_id": job["id"],
+        "market_title": job["title"],
+        "market_description_html": job["description_html"],
+        "price_usd": job["price"]
+    })
+
+@app.route('/queue/report', methods=['POST'])
+def legacy_report():
+    return report_job()
+
 @app.route('/cookies', methods=['POST'])
 def save_cookies():
     data = request.json
-    # B안 포맷 그대로 저장
     COOKIES_STORE['default'] = data
-    return jsonify({"status": "saved", "keys": list(data.keys())})
+    return jsonify({"status": "saved"})
 
-# 5. 쿠키 제공 (GET) - 🔴 이게 없어서 404가 떴던 겁니다!
 @app.route('/cookies', methods=['GET'])
 def get_cookies():
-    data = COOKIES_STORE.get('default', {})
-    # 없으면 빈 껍데기라도 줘서 에러 방지
-    if not data:
-        return jsonify({"cookies": [], "origins": []})
-    return jsonify(data)
+    return jsonify(COOKIES_STORE.get('default', {"cookies": [], "origins": []}))
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
