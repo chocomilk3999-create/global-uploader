@@ -12,106 +12,118 @@ app = Flask(__name__)
 GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
 GSHEET_TAB = os.getenv("GSHEET_TAB", "Sheet1").strip()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-LEASE_SECONDS = 300  # 5분
+LEASE_SECONDS = 300
 
-# --- STORAGE ---
 JOBS_QUEUE = []
 INFLIGHT = {}
-DONE_LOG = []
-
-# --- HELPERS ---
-def _get_service():
-    # 환경변수 JSON 문자열을 로드
-    creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if not creds_json: return None
-    try:
-        info = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-        return build("sheets", "v4", credentials=creds, cache_discovery=False)
-    except Exception as e:
-        print(f"Auth Error: {e}"); return None
-
-def _update_status(service, row_idx_0based, col_idx_0based, new_status):
-    # A1 표기법 변환 로직
-    def to_a1(c, r):
-        c += 1
-        s = ""
-        while c > 0: c, m = divmod(c - 1, 26); s = chr(65 + m) + s
-        return f"{s}{r + 1}"
-    
-    range_name = f"{GSHEET_TAB}!{to_a1(col_idx_0based, row_idx_0based)}"
-    try:
-        service.spreadsheets().values().update(
-            spreadsheetId=GSHEET_ID, range=range_name,
-            valueInputOption="USER_ENTERED", body={"values": [[new_status]]}
-        ).execute()
-    except Exception as e: print(f"Update Error: {e}")
 
 def now_ts(): return int(time.time())
 
+# --- AUTH HELPER (DEBUG MODE) ---
+def _get_service():
+    creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+    if not creds_json:
+        return None, "ERROR: ENV 'GOOGLE_APPLICATION_CREDENTIALS_JSON' is empty."
+
+    try:
+        info = json.loads(creds_json)
+    except Exception as e:
+        # JSON 파싱 실패 (줄바꿈 문제 등)
+        return None, f"ERROR: JSON Parse Failed. Check formatting. Details: {str(e)}"
+
+    try:
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        return svc, f"OK. Authenticated as: {info.get('client_email')}"
+    except Exception as e:
+        return None, f"ERROR: Google Auth/Build Failed. Details: {str(e)}"
+
+def to_a1(col0, row0):
+    c = col0 + 1
+    s = ""
+    while c > 0: c, m = divmod(c - 1, 26); s = chr(65 + m) + s
+    return f"{s}{row0 + 1}"
+
+def _update_status(service, row0, col0, new_status):
+    rng = f"{GSHEET_TAB}!{to_a1(col0, row0)}"
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=GSHEET_ID, range=rng,
+            valueInputOption="USER_ENTERED", body={"values": [[new_status]]},
+        ).execute()
+    except Exception as e: print(f"Update Error: {e}")
+
 def requeue_expired():
     expired = [k for k, v in INFLIGHT.items() if v["expires_at"] <= now_ts()]
-    count = 0
     for k in expired:
         rec = INFLIGHT.pop(k)
-        JOBS_QUEUE.append(rec["job"]) # 대기열 복귀
-        count += 1
-    return count
+        JOBS_QUEUE.append(rec["job"])
+    return len(expired)
 
 # --- ROUTES ---
 @app.route("/")
-def home(): return f"Empire Brain Online. Queue: {len(JOBS_QUEUE)}"
+def home():
+    return f"Empire Brain Online (Debug Mode). Queue={len(JOBS_QUEUE)} Inflight={len(INFLIGHT)}"
 
-@app.route("/jobs/push-from-sheet", methods=["POST", "GET"])
+# [NEW] 진단 엔드포인트
+@app.route("/debug/google")
+def debug_google():
+    svc, msg = _get_service()
+    ok = svc is not None
+    return jsonify({
+        "ok": ok, 
+        "message": msg, 
+        "target_sheet_id": GSHEET_ID,
+        "target_tab": GSHEET_TAB
+    })
+
+@app.route("/jobs/push-from-sheet", methods=["GET", "POST"])
 def push_from_sheet():
-    svc = _get_service()
-    if not svc: return jsonify({"ok": False, "error": "Google Auth Failed"}), 500
-    
+    svc, msg = _get_service()
+    if not svc:
+        return jsonify({"ok": False, "error": "Google Auth Failed", "debug_msg": msg}), 500
+
     limit = int(request.args.get("limit", 20))
-    resp = svc.spreadsheets().values().get(spreadsheetId=GSHEET_ID, range=f"{GSHEET_TAB}!A1:ZZ").execute()
+    try:
+        resp = svc.spreadsheets().values().get(spreadsheetId=GSHEET_ID, range=f"{GSHEET_TAB}!A1:ZZ").execute()
+    except Exception as e:
+        return jsonify({"ok": False, "error": "Sheet Read Failed", "detail": str(e), "hint": "Check Sheet Sharing (Editor)"}), 400
+        
     rows = resp.get("values", [])
-    if len(rows) < 2: return jsonify({"ok": False, "msg": "Sheet Empty"})
-    
+    if len(rows) < 2: return jsonify({"ok": False, "msg": "Sheet Empty"}), 200
+
     header = rows[0]
-    # 'status' 컬럼 찾기 (대소문자 무관)
     try:
         status_idx = next(i for i, h in enumerate(header) if str(h).strip().lower() == "status")
     except: return jsonify({"ok": False, "error": "No 'status' column"}), 400
-    
+
     pushed = 0
+    pushed_jobs = []
     for i in range(1, len(rows)):
         if pushed >= limit: break
         row = rows[i]
         curr = row[status_idx] if len(row) > status_idx else ""
-        
         if str(curr).strip().upper() == "NEW":
-            # Job 패키징 (행 데이터 전체 + 헤더)
             job = {
-                "id": str(uuid.uuid4()),
-                "sheet_row": i,
-                "sheet_status_col": status_idx,
-                "header": header,
-                "data": row
+                "id": str(uuid.uuid4()), "sheet_row": i, "sheet_status_col": status_idx,
+                "header": header, "data": row
             }
             JOBS_QUEUE.append(job)
             _update_status(svc, i, status_idx, "QUEUED")
             pushed += 1
-            
-    return jsonify({"ok": True, "pushed": pushed, "queue": len(JOBS_QUEUE)})
+            pushed_jobs.append(job["id"])
+
+    return jsonify({"ok": True, "pushed": pushed, "queue_len": len(JOBS_QUEUE)})
 
 @app.route("/jobs/lease", methods=["GET"])
 def lease():
     requeue_expired()
     if not JOBS_QUEUE: return jsonify({"ok": True, "job": None})
-    
     job = JOBS_QUEUE.pop(0)
     lid = str(uuid.uuid4())
     INFLIGHT[lid] = {"job": job, "expires_at": now_ts() + LEASE_SECONDS}
-    
-    # 상태: INFLIGHT
-    svc = _get_service()
+    svc, _ = _get_service()
     if svc: _update_status(svc, job["sheet_row"], job["sheet_status_col"], "INFLIGHT")
-    
     return jsonify({"ok": True, "job": job, "lease_id": lid})
 
 @app.route("/jobs/ack", methods=["POST"])
@@ -119,13 +131,10 @@ def ack():
     data = request.json or {}
     lid = data.get("lease_id")
     status = data.get("status", "DRAFTED")
-    
     if lid in INFLIGHT:
         rec = INFLIGHT.pop(lid)
-        job = rec["job"]
-        # 상태: 완료 (DRAFTED 등)
-        svc = _get_service()
-        if svc: _update_status(svc, job["sheet_row"], job["sheet_status_col"], status)
+        svc, _ = _get_service()
+        if svc: _update_status(svc, rec["job"]["sheet_row"], rec["job"]["sheet_status_col"], status)
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "No Lease"}), 400
 
@@ -133,19 +142,16 @@ def ack():
 def fail():
     data = request.json or {}
     lid = data.get("lease_id")
-    
     if lid in INFLIGHT:
         rec = INFLIGHT.pop(lid)
-        job = rec["job"]
-        JOBS_QUEUE.append(job) # 재시도 위해 복귀
-        # 상태: FAILED (잠시 표시)
-        svc = _get_service()
-        if svc: _update_status(svc, job["sheet_row"], job["sheet_status_col"], "FAILED")
+        JOBS_QUEUE.append(rec["job"])
+        svc, _ = _get_service()
+        if svc: _update_status(svc, rec["job"]["sheet_row"], rec["job"]["sheet_status_col"], "FAILED")
         return jsonify({"ok": True, "res": "Requeued"})
     return jsonify({"ok": False}), 400
 
 @app.route("/cookies", methods=["GET"])
 def cookies(): return jsonify({"cookies": []})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
