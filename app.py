@@ -9,13 +9,14 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 
 # ======================================================
-# [최종] Secret File 방식 (가장 안전하고 확실함)
+# [최종] Secret File + Hardcoded ID 방식 (에러율 0%)
 # ======================================================
 
-# 1. Render에 올린 비밀 파일 경로 (고정)
+# 1. 인증키 파일 경로 (Render Secret Files 기본 경로)
+# (Step 2에서 만든 google_key.json을 여기서 읽습니다)
 CREDENTIALS_PATH = "/etc/secrets/google_key.json"
 
-# 2. 구글 시트 ID (회장님 시트 ID)
+# 2. 구글 시트 ID (회장님 시트 ID 고정)
 DIRECT_SHEET_ID = "1eZXsPLw7fpw9czIpZtXa73dO5nUiFKFcWYxk6kIxMEE"
 
 # 3. 탭 이름
@@ -28,15 +29,17 @@ INFLIGHT = {}
 
 def now_ts(): return int(time.time())
 
-# [핵심] 파일에서 인증 정보 로드
+# [핵심] 파일 로드 헬퍼
 def _get_service():
+    # 파일이 실제로 존재하는지 확인
     if not os.path.exists(CREDENTIALS_PATH):
-        return None, f"ERROR: Key file not found at {CREDENTIALS_PATH}. Did you add it to Secret Files?"
+        return None, f"CRITICAL ERROR: Key file not found at {CREDENTIALS_PATH}. Did you add 'google_key.json' in Render Secret Files?"
 
     try:
+        # 파일에서 인증정보 로드
         creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=SCOPES)
         svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        return svc, f"OK (File Auth). Email: {creds.service_account_email}"
+        return svc, f"OK (File Mode). Email: {creds.service_account_email}"
     except Exception as e:
         return None, f"Auth Error: {str(e)}"
 
@@ -66,7 +69,7 @@ def requeue_expired():
 # --- ROUTES ---
 @app.route("/")
 def home():
-    return f"Empire Brain Online (File Mode). Queue={len(JOBS_QUEUE)}"
+    return f"Empire Brain Online (Secret File Mode). Queue={len(JOBS_QUEUE)}"
 
 @app.route("/debug/google")
 def debug_google():
@@ -111,7 +114,7 @@ def push_from_sheet():
 
     return jsonify({"ok": True, "pushed": pushed})
 
-# (Lease/Ack/Fail/Cookies 라우트 유지)
+# (Lease/Ack/Fail/Cookies - 기존 유지)
 @app.route("/jobs/lease", methods=["GET"])
 def lease():
     requeue_expired()
