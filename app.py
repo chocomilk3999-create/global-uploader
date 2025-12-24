@@ -1,240 +1,218 @@
 import os
 import time
-import json
 import uuid
+import json
 from flask import Flask, request, jsonify
-from google.oauth2 import service_account
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
 # =========================
-# 1. QUEUE STORAGE (In-Memory)
+# CONFIG & STATE
 # =========================
-JOBS_QUEUE = []            # 대기 중인 작업 (READY)
-INFLIGHT = {}              # 진행 중인 작업 (LEASED) -> {lease_id: {job, expires_at}}
-DONE_LOG = []              # 완료된 작업 로그
-
-LEASE_SECONDS_DEFAULT = 300  # 5분 임대
-
-# Google Sheets Config
+# 구글 시트 설정
+GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
+GSHEET_TAB = os.getenv("GSHEET_TAB", "Sheet1").strip()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# 큐 설정
+LEASE_SECONDS_DEFAULT = 300  # 5분 임대
+JOBS_QUEUE = []              # 대기열 (READY)
+INFLIGHT = {}                # 진행중 (LEASED) -> {lease_id: {job, expires_at}}
+DONE_LOG = []                # 완료 로그
+
 # =========================
-# 2. GOOGLE SHEETS HELPER
+# GOOGLE SHEETS HELPER
 # =========================
-def _gsheets_service():
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not sa_json: return None
+def _get_service():
+    # Render 환경변수에서 JSON 문자열을 로드
+    creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not creds_json: return None
     try:
-        info = json.loads(sa_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
         return build("sheets", "v4", credentials=creds, cache_discovery=False)
     except Exception as e:
-        print(f"Auth Error: {e}")
+        print(f"GSheet Auth Error: {e}")
         return None
 
-def _get_sheet_values(service, spreadsheet_id, sheet_name, a1_range="A:ZZ"):
-    try:
-        resp = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!{a1_range}", valueRenderOption="UNFORMATTED_VALUE"
-        ).execute()
-        return resp.get("values", [])
-    except: return []
-
-def _batch_update_cells(service, spreadsheet_id, updates):
-    if not updates: return
-    try:
-        data = [{"range": rng, "values": [[val]]} for rng, val in updates]
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id, body={"valueInputOption": "USER_ENTERED", "data": data}
-        ).execute()
-    except: pass
-
-def _col_to_a1(n):
-    s = ""
-    while n > 0: n, r = divmod(n - 1, 26); s = chr(65 + r) + s
-    return s
-
-def _find_header_map(values):
-    return {str(name).strip(): idx for idx, name in enumerate(values[0]) if str(name).strip()} if values else {}
-
-def _row_get(row, hmap, key):
-    idx = hmap.get(key)
-    return row[idx] if idx is not None and idx < len(row) else None
-
-def _sheet_row_to_job(row_data, hmap):
-    if not row_data: return None
-    # 필수 필드 매핑
-    title = _row_get(row_data, hmap, "title") or _row_get(row_data, hmap, "market_title")
-    price = _row_get(row_data, hmap, "price") or _row_get(row_data, hmap, "sell_price")
+def _update_cell(service, row_idx, col_idx, value):
+    # row_idx: 0-based (0 -> 1행), col_idx: 0-based (0 -> A열)
+    # A1 표기법 변환
+    def to_a1(c, r):
+        s = ""
+        c += 1 # 1-based 변환
+        while c > 0: c, m = divmod(c - 1, 26); s = chr(65 + m) + s
+        return f"{s}{r + 1}"
     
-    # 사진 추출
-    photos = []
-    for k in ["photo_url_1", "photo_url_2", "image_url_main", "photos"]:
-        v = _row_get(row_data, hmap, k)
-        if v and isinstance(v, str) and v.startswith("http"): photos.append(v)
-
-    if not title: return None
-
-    # 가격 안전 변환
-    try: final_price = float(price) if price else 0.0
-    except: final_price = 0.0
-
-    return {
-        "id": str(_row_get(row_data, hmap, "item_id") or int(time.time()*1000)),
-        "title": str(title),
-        "price": final_price,
-        "photos": list(set(photos)),
-        "status": "NEW"
-    }
+    range_name = f"{GSHEET_TAB}!{to_a1(col_idx, row_idx)}"
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=GSHEET_ID, range=range_name,
+            valueInputOption="USER_ENTERED", body={"values": [[value]]}
+        ).execute()
+    except Exception as e:
+        print(f"Sheet Update Error: {e}")
 
 # =========================
-# 3. QUEUE LOGIC (Lease/Ack)
+# QUEUE LOGIC
 # =========================
-def now_ts():
-    return int(time.time())
+def now_ts(): return int(time.time())
 
-def requeue_expired_internal():
-    """만료된 임대 작업을 READY로 복귀 (부활)"""
-    t = now_ts()
-    # 만료된 lease_id 찾기
-    expired_ids = [lid for lid, rec in INFLIGHT.items() if rec.get("expires_at", 0) <= t]
+def requeue_expired():
+    # 만료된 작업 회수
+    expired = [lid for lid, rec in INFLIGHT.items() if rec["expires_at"] <= now_ts()]
     count = 0
-    for lid in expired_ids:
-        rec = INFLIGHT.pop(lid, None)
-        if rec and rec.get("job"):
-            JOBS_QUEUE.append(rec["job"]) # 대기열 맨 뒤로 복귀
-            count += 1
+    for lid in expired:
+        rec = INFLIGHT.pop(lid)
+        # 다시 대기열로 복귀 (Queue Loss 방지)
+        JOBS_QUEUE.append(rec["job"])
+        count += 1
+        # (옵션) 시트 상태를 다시 QUEUED로 돌릴 수도 있음
     return count
 
 # =========================
-# 4. API ROUTES
+# API ENDPOINTS
 # =========================
-@app.route('/')
+@app.route("/")
 def home():
     return f"Empire Server vFinal. Ready: {len(JOBS_QUEUE)}, In-Flight: {len(INFLIGHT)}"
 
 @app.route("/jobs/stats")
-def jobs_stats():
-    requeued = requeue_expired_internal()
+def stats():
     return jsonify({
         "ok": True,
-        "queue_ready": len(JOBS_QUEUE),
-        "queue_inflight": len(INFLIGHT),
-        "requeued_now": requeued,
-        "done_total": len(DONE_LOG)
+        "ready": len(JOBS_QUEUE),
+        "inflight": len(INFLIGHT),
+        "requeued": requeue_expired(),
+        "done": len(DONE_LOG)
     })
 
-# --- [CRITICAL] Missing Part Added Back ---
+# [1] 시트 읽기 -> 큐 주입 (Make 대체)
 @app.route("/jobs/push-from-sheet", methods=["POST", "GET"])
-def jobs_push_from_sheet():
-    svc = _gsheets_service()
-    if not svc: return jsonify({"ok": False, "error": "Google Auth Failed"}), 500
+def push_from_sheet():
+    svc = _get_service()
+    if not svc: return jsonify({"ok": False, "error": "Auth Failed"}), 500
     
-    sid = os.environ.get("GSHEET_SPREADSHEET_ID")
-    sname = os.environ.get("GSHEET_SHEET_NAME")
-    limit = int(request.args.get("limit") or 10)
+    limit = int(request.args.get("limit", 20))
     
-    values = _get_sheet_values(svc, sid, sname)
-    if not values: return jsonify({"ok": False, "error": "Sheet Empty or Read Fail"}), 400
-
-    hmap = _find_header_map(values)
-    if "status" not in hmap: return jsonify({"ok": False, "error": "No 'status' column"}), 400
+    # 전체 데이터 읽기 (헤더 포함)
+    resp = svc.spreadsheets().values().get(spreadsheetId=GSHEET_ID, range=f"{GSHEET_TAB}!A1:ZZ").execute()
+    rows = resp.get("values", [])
+    if len(rows) < 2: return jsonify({"ok": False, "msg": "Empty Sheet"})
     
-    pushed_jobs = []
-    updates = []
-    count = 0
+    header = rows[0]
+    # 헤더 매핑 (status 컬럼 찾기)
+    try:
+        status_idx = next(i for i, h in enumerate(header) if str(h).strip().lower() == "status")
+    except:
+        return jsonify({"ok": False, "error": "No 'status' column found"}), 400
     
-    # 헤더 제외하고 순회
-    for i in range(1, len(values)):
-        if count >= limit: break
-        row = values[i]
+    pushed = 0
+    
+    for i in range(1, len(rows)): # 데이터 행 반복
+        if pushed >= limit: break
+        row = rows[i]
         
-        # 'NEW' 상태인 것만 가져옴
-        status_val = str(_row_get(row, hmap, "status")).strip().upper()
-        if status_val != "NEW": continue
+        # status 확인 (안전하게 가져오기)
+        current_status = row[status_idx] if len(row) > status_idx else ""
+        if str(current_status).strip().upper() != "NEW": continue
         
-        job = _sheet_row_to_job(row, hmap)
-        if not job: continue
+        # Job 생성 (필요한 컬럼 매핑 - 형 시트에 맞춰 수정 가능)
+        # 여기서는 단순히 행 전체와 인덱스를 저장
+        job = {
+            "id": str(uuid.uuid4()),
+            "sheet_row_idx": i,       # 중요: 0-based 행 인덱스
+            "sheet_status_col": status_idx,
+            "data": row,              # 행 데이터 통째로 (Agent가 파싱)
+            "header": header          # 헤더 정보도 전달
+        }
         
-        # 큐에 추가
         JOBS_QUEUE.append(job)
-        pushed_jobs.append(job)
-        count += 1
         
-        # 시트 상태 업데이트 (NEW -> QUEUED)
-        # i번째 행 -> 실제 시트 행번호는 i+1
-        updates.append((f"{sname}!{_col_to_a1(hmap['status']+1)}{i+1}", "QUEUED"))
-            
-    if updates: _batch_update_cells(svc, sid, updates)
-    
-    return jsonify({
-        "ok": True, 
-        "pushed_count": count, 
-        "queue_ready": len(JOBS_QUEUE)
-    })
+        # 시트 상태 업데이트: NEW -> QUEUED
+        _update_cell(svc, i, status_idx, "QUEUED")
+        pushed += 1
+        
+    return jsonify({"ok": True, "pushed": pushed, "queue_len": len(JOBS_QUEUE)})
 
-# --- Lease Logic ---
+# [2] 작업 임대 (Agent가 가져감)
 @app.route("/jobs/lease", methods=["GET"])
-def jobs_lease():
-    lease_seconds = int(request.args.get("lease_seconds", LEASE_SECONDS_DEFAULT))
+def lease():
+    requeue_expired() # 만료 회수 먼저
     
-    # 1. 만료된 것 먼저 회수
-    requeued = requeue_expired_internal()
-
-    # 2. 대기열 확인
     if not JOBS_QUEUE:
-        return jsonify({"ok": True, "job": None, "requeued": requeued})
-
-    # 3. 작업 꺼내기 (FIFO)
+        return jsonify({"ok": True, "job": None})
+    
+    # 큐에서 하나 꺼냄 (FIFO)
     job = JOBS_QUEUE.pop(0)
     
-    # 4. 임대 장부(INFLIGHT)에 기록
     lease_id = str(uuid.uuid4())
     INFLIGHT[lease_id] = {
         "job": job,
-        "expires_at": now_ts() + lease_seconds
+        "expires_at": now_ts() + LEASE_SECONDS_DEFAULT
     }
-
+    
+    # 시트 상태 업데이트: QUEUED -> INFLIGHT
+    svc = _get_service()
+    if svc:
+        _update_cell(svc, job["sheet_row_idx"], job["sheet_status_col"], "INFLIGHT")
+        
     return jsonify({
         "ok": True,
         "job": job,
-        "lease_id": lease_id,
-        "expires_at": INFLIGHT[lease_id]["expires_at"]
+        "lease_id": lease_id
     })
 
-# --- Ack Logic ---
+# [3] 성공 보고 (Ack)
 @app.route("/jobs/ack", methods=["POST"])
-def jobs_ack():
+def ack():
     data = request.json or {}
     lease_id = data.get("lease_id")
-    status = data.get("status", "DONE")
-
-    if lease_id in INFLIGHT:
-        rec = INFLIGHT.pop(lease_id) # 장부에서 제거 (완전 처리됨)
-        DONE_LOG.append({"id": rec["job"]["id"], "status": status, "at": now_ts()})
-        return jsonify({"ok": True, "result": "ACK_ACCEPTED"})
-    
-    return jsonify({"ok": False, "error": "LEASE_NOT_FOUND_OR_EXPIRED"}), 400
-
-@app.route("/jobs/fail", methods=["POST"])
-def jobs_fail():
-    data = request.json or {}
-    lease_id = data.get("lease_id")
+    status = data.get("status", "DRAFTED") # 기본값 DRAFTED
     
     if lease_id in INFLIGHT:
         rec = INFLIGHT.pop(lease_id)
-        # 실패했으므로 다시 대기열로 복귀
-        JOBS_QUEUE.append(rec["job"])
+        job = rec["job"]
+        DONE_LOG.append({"id": job["id"], "ts": now_ts()})
+        
+        # 시트 상태 업데이트: INFLIGHT -> DRAFTED (또는 형이 보낸 status)
+        svc = _get_service()
+        if svc:
+            _update_cell(svc, job["sheet_row_idx"], job["sheet_status_col"], status)
+            
+        return jsonify({"ok": True, "result": "ACK"})
+    
+    return jsonify({"ok": False, "error": "Invalid Lease"}), 400
+
+# [4] 실패 보고 (Fail)
+@app.route("/jobs/fail", methods=["POST"])
+def fail():
+    data = request.json or {}
+    lease_id = data.get("lease_id")
+    reason = data.get("reason", "Error")
+    
+    if lease_id in INFLIGHT:
+        rec = INFLIGHT.pop(lease_id)
+        job = rec["job"]
+        
+        # 다시 큐에 넣음 (재시도) - 또는 영구 실패 처리 가능
+        # 여기서는 '재시도'를 위해 큐에 넣고 시트는 FAILED로 표시
+        JOBS_QUEUE.append(job) 
+        
+        svc = _get_service()
+        if svc:
+            _update_cell(svc, job["sheet_row_idx"], job["sheet_status_col"], "FAILED")
+            # 에러 메시지 컬럼이 있다면 거기에 reason을 적을 수도 있음
+            
         return jsonify({"ok": True, "result": "REQUEUED"})
         
-    return jsonify({"ok": False, "error": "LEASE_NOT_FOUND"}), 400
+    return jsonify({"ok": False, "error": "Invalid Lease"}), 400
 
+# [5] 쿠키 (옵션)
 @app.route("/cookies", methods=["GET"])
-def get_cookies():
-    # 쿠키 로직이 필요하다면 여기에 구현 (현재는 빈 리스트 반환 예시)
-    return jsonify({"cookies": []})
+def cookies(): return jsonify({"cookies": []}) # 필요 시 구현
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    app.run(host='0.0.0.0', port=10000)
