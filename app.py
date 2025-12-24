@@ -9,18 +9,17 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 
 # ======================================================
-# [최종] Secret File + Hardcoded ID 방식 (에러율 0%)
+# [최종] Secret File + 시트 이름 동기화 완료
 # ======================================================
 
-# 1. 인증키 파일 경로 (Render Secret Files 기본 경로)
-# (Step 2에서 만든 google_key.json을 여기서 읽습니다)
+# 1. 인증키 파일 경로
 CREDENTIALS_PATH = "/etc/secrets/google_key.json"
 
 # 2. 구글 시트 ID (회장님 시트 ID 고정)
 DIRECT_SHEET_ID = "1eZXsPLw7fpw9czIpZtXa73dO5nUiFKFcWYxk6kIxMEE"
 
-# 3. 탭 이름
-DIRECT_SHEET_TAB = "Sheet1"
+# 3. 탭 이름 (★여기를 수정했습니다★)
+DIRECT_SHEET_TAB = "HQ_RESELL_DB"
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 LEASE_SECONDS = 300
@@ -31,19 +30,17 @@ def now_ts(): return int(time.time())
 
 # [핵심] 파일 로드 헬퍼
 def _get_service():
-    # 파일이 실제로 존재하는지 확인
     if not os.path.exists(CREDENTIALS_PATH):
-        return None, f"CRITICAL ERROR: Key file not found at {CREDENTIALS_PATH}. Did you add 'google_key.json' in Render Secret Files?"
+        return None, f"CRITICAL ERROR: Key file not found at {CREDENTIALS_PATH}."
 
     try:
-        # 파일에서 인증정보 로드
         creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=SCOPES)
         svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
         return svc, f"OK (File Mode). Email: {creds.service_account_email}"
     except Exception as e:
         return None, f"Auth Error: {str(e)}"
 
-# --- UTILS (기존 동일) ---
+# --- UTILS ---
 def to_a1(col0, row0):
     c = col0 + 1
     s = ""
@@ -69,7 +66,7 @@ def requeue_expired():
 # --- ROUTES ---
 @app.route("/")
 def home():
-    return f"Empire Brain Online (Secret File Mode). Queue={len(JOBS_QUEUE)}"
+    return f"Empire Brain Online (HQ_RESELL_DB). Queue={len(JOBS_QUEUE)}"
 
 @app.route("/debug/google")
 def debug_google():
@@ -77,7 +74,8 @@ def debug_google():
     return jsonify({
         "ok": svc is not None,
         "message": msg,
-        "target_sheet_id": DIRECT_SHEET_ID
+        "target_sheet_id": DIRECT_SHEET_ID,
+        "target_tab_name": DIRECT_SHEET_TAB
     })
 
 @app.route("/jobs/push-from-sheet", methods=["GET", "POST"])
@@ -87,6 +85,7 @@ def push_from_sheet():
 
     limit = int(request.args.get("limit", 20))
     try:
+        # 수정된 탭 이름으로 데이터 읽기
         resp = svc.spreadsheets().values().get(spreadsheetId=DIRECT_SHEET_ID, range=f"{DIRECT_SHEET_TAB}!A1:ZZ").execute()
     except Exception as e:
         return jsonify({"ok": False, "error": "Sheet Read Failed", "detail": str(e)}), 400
@@ -100,7 +99,6 @@ def push_from_sheet():
     except: return jsonify({"ok": False, "error": "No 'status' column"}), 400
 
     pushed = 0
-    pushed_jobs = []
     for i in range(1, len(rows)):
         if pushed >= limit: break
         row = rows[i]
@@ -110,11 +108,10 @@ def push_from_sheet():
             JOBS_QUEUE.append(job)
             _update_status(svc, i, status_idx, "QUEUED")
             pushed += 1
-            pushed_jobs.append(job["id"])
 
     return jsonify({"ok": True, "pushed": pushed})
 
-# (Lease/Ack/Fail/Cookies - 기존 유지)
+# (Lease/Ack/Fail/Cookies 기존 유지)
 @app.route("/jobs/lease", methods=["GET"])
 def lease():
     requeue_expired()
