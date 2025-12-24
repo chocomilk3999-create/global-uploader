@@ -1,207 +1,159 @@
-import os
+# app.py (추가/교체용 코드)
 import time
-import json
+import uuid
 from flask import Flask, request, jsonify
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# --- MEMORY STORAGE ---
-JOBS_QUEUE = []          # 작업 대기열
-JOBS_BY_ID = {}          # 작업 상세 내용
-JOB_REPORTS = []         # 결과 로그
+# -------------------------
+# In-memory stores
+# -------------------------
+JOBS_QUEUE = []            # READY jobs (list of dict)
+INFLIGHT = {}              # lease_id -> {"job": job, "expires_at": ts}
+DONE_LOG = []              # optional: completed job ids
 
-# --- CONFIG & HELPERS ---
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+LEASE_SECONDS_DEFAULT = 300  # 5분 (필요하면 120~600 사이로 조절)
 
-def _gsheets_service():
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not sa_json:
-        print("⚠️ [Warning] GOOGLE_SERVICE_ACCOUNT_JSON is missing.")
-        return None
-    try:
-        info = json.loads(sa_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-        return build("sheets", "v4", credentials=creds, cache_discovery=False)
-    except Exception as e:
-        print(f"❌ [Sheet Auth Error] {e}")
-        return None
+def now_ts():
+    return int(time.time())
 
-def _get_sheet_values(service, spreadsheet_id, sheet_name, a1_range="A:ZZ"):
-    try:
-        resp = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!{a1_range}", valueRenderOption="UNFORMATTED_VALUE"
-        ).execute()
-        return resp.get("values", [])
-    except Exception as e: return []
+def normalize_market(m):
+    return (m or "US").upper()
 
-def _batch_update_cells(service, spreadsheet_id, updates):
-    if not updates: return
-    try:
-        data = [{"range": rng, "values": [[val]]} for rng, val in updates]
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id, body={"valueInputOption": "USER_ENTERED", "data": data}
-        ).execute()
-    except Exception as e: print(f"❌ [Sheet Update Error] {e}")
-
-def _col_to_a1(n):
-    s = ""
-    while n > 0: n, r = divmod(n - 1, 26); s = chr(65 + r) + s
-    return s
-
-def _find_header_map(values): 
-    # 헤더를 찾아서 {컬럼명: 인덱스}로 만듦
-    return {str(name).strip(): idx for idx, name in enumerate(values[0]) if str(name).strip()} if values else {}
-
-def _row_get(row, hmap, key):
-    # 안전하게 값 가져오기
-    idx = hmap.get(key)
-    if idx is not None and idx < len(row):
-        return row[idx]
-    return None
-
-def _sheet_row_to_job(row_data, hmap):
-    """
-    형이 준 해결책 적용! 
-    구글 시트의 다양한 컬럼 이름을 표준화해서 job dict로 만듦
-    """
-    if not row_data:
-        return None
-
-    # 1. Row 데이터를 dict 형태로 변환 (편의상)
-    # (하지만 hmap을 쓰는게 더 빠르니 hmap으로 직접 매핑)
-    
-    # Title 매핑
-    title = _row_get(row_data, hmap, "title") or \
-            _row_get(row_data, hmap, "market_title") or \
-            _row_get(row_data, hmap, "source_title") or \
-            _row_get(row_data, hmap, "topic_or_product")
-            
-    # Price 매핑
-    price = _row_get(row_data, hmap, "price") or \
-            _row_get(row_data, hmap, "Sell_Price") or \
-            _row_get(row_data, hmap, "sell_price") or \
-            _row_get(row_data, hmap, "expected_sale_price")
-
-    # Market 매핑
-    market = (_row_get(row_data, hmap, "market") or "US").upper()
-    
-    # Target 매핑
-    target = _row_get(row_data, hmap, "target_marketplace") or \
-             _row_get(row_data, hmap, "ad_platform") or "ebay"
-
-    # Photos 매핑 (여러 컬럼 확인)
-    photos = []
-    for k in ["photo_url_1", "photo_url_2", "image_url_main", "image_url_alt", "photos"]:
-        v = _row_get(row_data, hmap, k)
-        if v and isinstance(v, str) and v.startswith("http"):
-            photos.append(v)
-
-    # 필수값 체크 (제목이나 사진 없으면 탈락)
-    if not title or not photos:
-        return None 
-
-    # 최종 JOB 생성
-    try:
-        final_price = float(price) if price else 0.0
-    except:
-        final_price = 0.0
-
-    job = {
-        "id": str(_row_get(row_data, hmap, "item_id") or _row_get(row_data, hmap, "id") or int(time.time())),
-        "title": str(title),
-        "price": final_price,
-        "market": str(market),
-        "target_marketplace": str(target),
-        "origin_model": str(_row_get(row_data, hmap, "origin_model") or "RESELL"),
-        "photos": list(set(photos)), # 중복제거
-        "description_html": str(_row_get(row_data, hmap, "market_description") or _row_get(row_data, hmap, "description_html") or ""),
-        "shipping_policy": str(_row_get(row_data, hmap, "shipping_policy") or "eIS"),
-    }
-    return job
-
-# --- ROUTES ---
-@app.route('/')
-def home(): return f"Empire Server v12.0 (Fixed). Queue: {len(JOBS_QUEUE)}"
-
-@app.route("/jobs/push-from-sheet", methods=["POST", "GET"])
-def jobs_push_from_sheet():
-    svc = _gsheets_service()
-    if not svc: return jsonify({"ok": False, "error": "Service Account Error"}), 500
-    
-    sid = os.environ.get("GSHEET_SPREADSHEET_ID")
-    sname = os.environ.get("GSHEET_SHEET_NAME")
-    limit = int(request.args.get("limit") or 5)
-    
-    # 시트 읽기
-    values = _get_sheet_values(svc, sid, sname)
-    hmap = _find_header_map(values)
-    
-    if "status" not in hmap: 
-        return jsonify({"ok": False, "error": "No 'status' column found"}), 400
-    
-    pushed_jobs = []
-    updates = []
+def requeue_expired_internal():
+    """만료된 임대 작업을 READY로 복귀"""
+    t = now_ts()
+    expired = [lease_id for lease_id, rec in INFLIGHT.items() if rec.get("expires_at", 0) <= t]
     count = 0
-    
-    for i in range(1, len(values)):
-        if count >= limit: break
-        row = values[i]
-        
-        # STATUS 확인 (대소문자 무시하고 NEW 체크)
-        status_val = str(_row_get(row, hmap, "status")).strip().upper()
-        if status_val != "NEW": 
-            continue
-        
-        # 형이 준 로직으로 Job 변환
-        job = _sheet_row_to_job(row, hmap)
-        
-        if not job:
-            # NEW지만 데이터가 부족해서 job 생성이 안된 경우
-            # 로그에 남기거나 넘어가야 함. 여기선 일단 넘어감.
-            pushed_jobs.append(None) 
-            continue
-        
-        jid = job["id"]
-        if jid not in JOBS_BY_ID:
-            JOBS_BY_ID[jid] = job
-            JOBS_QUEUE.append(jid)
-            pushed_jobs.append(job)
+    for lease_id in expired:
+        rec = INFLIGHT.pop(lease_id, None)
+        if rec and rec.get("job"):
+            JOBS_QUEUE.append(rec["job"])
             count += 1
-            # 시트 상태 업데이트 (NEW -> QUEUED)
-            updates.append((f"{sname}!{_col_to_a1(hmap['status']+1)}{i+1}", "QUEUED"))
-            
-    if updates: _batch_update_cells(svc, sid, updates)
-    
+    return count
+
+def pop_ready_job_by_market(market: str):
+    """READY에서 market에 맞는 1개를 뽑되 '삭제'는 하지 않고, 밖에서 옮기게 함"""
+    for i, job in enumerate(JOBS_QUEUE):
+        if normalize_market(job.get("market")) == normalize_market(market):
+            return i, job
+    return None, None
+
+# -------------------------
+# Health / Debug
+# -------------------------
+@app.route("/jobs/stats", methods=["GET"])
+def jobs_stats():
+    requeued = requeue_expired_internal()
     return jsonify({
-        "ok": True, 
-        "pushed_count": count, 
-        "pushed_jobs": pushed_jobs, # 이제 여기에 진짜 데이터가 보일 거야
-        "queue_len": len(JOBS_QUEUE)
+        "ok": True,
+        "queue_ready": len(JOBS_QUEUE),
+        "queue_inflight": len(INFLIGHT),
+        "requeued_now": requeued,
+        "done_count": len(DONE_LOG),
     })
 
-@app.route("/jobs/next", methods=["GET"])
-def jobs_next():
-    market = (request.args.get("market") or "").upper()
-    picked = None
-    
-    # 큐에서 하나씩 꺼내보며 조건(Market) 맞는지 확인
-    for idx, jid in enumerate(list(JOBS_QUEUE)):
-        job = JOBS_BY_ID.get(str(jid))
-        if not job: continue
-        
-        # 만약 market 파라미터가 있으면 필터링, 없으면 그냥 줌
-        if market and job.get("market") != market: 
-            # US 요청인데 job이 KR이면 패스하는 로직
-            # 하지만 형 데이터는 기본이 US라 괜찮음
-            pass 
-            
-        picked = job
-        JOBS_QUEUE.pop(idx) # 큐에서 삭제 (꺼냄)
-        break
-        
-    return jsonify({"ok": True, "job": picked, "queue_len": len(JOBS_QUEUE)})
+# -------------------------
+# PUSH (이미 만들어둔 것 사용 가능)
+# -------------------------
+@app.route("/jobs/push", methods=["POST"])
+def jobs_push():
+    data = request.json or {}
+    job = data.get("job")
+    if not isinstance(job, dict):
+        return jsonify({"ok": False, "error": "job must be dict"}), 400
+    # 최소 필드 보정
+    job.setdefault("id", str(int(time.time() * 1000)))
+    job.setdefault("market", "US")
+    JOBS_QUEUE.append(job)
+    return jsonify({"ok": True, "queued": len(JOBS_QUEUE)})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+# -------------------------
+# LEASE (증발 방지 핵심)
+# -------------------------
+@app.route("/jobs/lease", methods=["GET"])
+def jobs_lease():
+    market = normalize_market(request.args.get("market", "US"))
+    lease_seconds = int(request.args.get("lease_seconds", LEASE_SECONDS_DEFAULT))
+
+    # 만료 회수 먼저
+    requeued = requeue_expired_internal()
+
+    idx, job = pop_ready_job_by_market(market)
+    if job is None:
+        return jsonify({
+            "ok": True,
+            "job": None,
+            "lease_id": None,
+            "queue_ready": len(JOBS_QUEUE),
+            "queue_inflight": len(INFLIGHT),
+            "requeued_now": requeued
+        })
+
+    # READY에서 제거하고 INFLIGHT로 이동
+    JOBS_QUEUE.pop(idx)
+    lease_id = str(uuid.uuid4())
+    INFLIGHT[lease_id] = {
+        "job": job,
+        "expires_at": now_ts() + max(30, lease_seconds)  # 최소 30초 보장
+    }
+
+    return jsonify({
+        "ok": True,
+        "job": job,
+        "lease_id": lease_id,
+        "expires_at": INFLIGHT[lease_id]["expires_at"],
+        "queue_ready": len(JOBS_QUEUE),
+        "queue_inflight": len(INFLIGHT),
+        "requeued_now": requeued
+    })
+
+# -------------------------
+# ACK (작업 확정)
+# -------------------------
+@app.route("/jobs/ack", methods=["POST"])
+def jobs_ack():
+    data = request.json or {}
+    lease_id = data.get("lease_id")
+    status = (data.get("status") or "DONE").upper()
+
+    if not lease_id or lease_id not in INFLIGHT:
+        return jsonify({"ok": False, "error": "invalid lease_id"}), 400
+
+    rec = INFLIGHT.pop(lease_id)
+    job = rec.get("job") or {}
+    DONE_LOG.append({
+        "job_id": job.get("id"),
+        "status": status,
+        "at": now_ts()
+    })
+    return jsonify({"ok": True, "job_id": job.get("id"), "status": status})
+
+# -------------------------
+# FAIL/REQUEUE (수동 회수)
+# -------------------------
+@app.route("/jobs/fail", methods=["POST"])
+def jobs_fail():
+    data = request.json or {}
+    lease_id = data.get("lease_id")
+    reason = data.get("reason", "unknown")
+
+    if not lease_id or lease_id not in INFLIGHT:
+        return jsonify({"ok": False, "error": "invalid lease_id"}), 400
+
+    rec = INFLIGHT.pop(lease_id)
+    job = rec.get("job") or {}
+    job["last_fail_reason"] = reason
+    job["last_fail_at"] = now_ts()
+    JOBS_QUEUE.append(job)
+    return jsonify({"ok": True, "requeued": True, "job_id": job.get("id")})
+
+# -------------------------
+# OPTIONAL: 기존 next 유지(레거시 호환)
+# - 이제는 "lease"로 내부 위임(증발 방지)
+# -------------------------
+@app.route("/jobs/next", methods=["GET"])
+def jobs_next_legacy():
+    # 레거시 호출을 lease로 돌려서 '증발' 없게 만들기
+    market = request.args.get("market", "US")
+    return jobs_lease()
