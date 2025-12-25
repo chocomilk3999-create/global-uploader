@@ -76,6 +76,7 @@ def requeue_expired():
     expired = [k for k, v in INFLIGHT.items() if v["expires_at"] <= now_ts()]
     for lid in expired:
         rec = INFLIGHT.pop(lid)
+        # 만료된 건은 다시 큐에 넣어서 재시도 기회 부여
         JOBS_QUEUE.append(rec["job"])
     return len(expired)
 
@@ -116,6 +117,8 @@ def push_from_sheet():
             break
         row = rows[i]
         curr = row[status_idx] if len(row) > status_idx else ""
+        
+        # 'NEW' 상태인 것만 가져감
         if str(curr).strip().upper() == "NEW":
             job = {
                 "id": str(uuid.uuid4()),
@@ -158,7 +161,7 @@ def ack():
     data = request.json or {}
     lid = data.get("lease_id")
     status = data.get("status", "DRAFTED")
-    updates = data.get("updates", {})  # ✅ 추가
+    updates = data.get("updates", {}) 
 
     if lid not in INFLIGHT:
         return jsonify({"ok": False, "error": "No Lease"}), 400
@@ -172,7 +175,7 @@ def ack():
         try:
             # status write
             sheet_update_cell(svc, job["sheet_row"], job["sheet_status_col"], status)
-            # ✅ additional fields write
+            # additional fields write (URL, ID 등)
             sheet_update_by_header(svc, job["sheet_row"], header, updates)
         except Exception as e:
             return jsonify({"ok": False, "error": "Sheet Update Failed", "detail": str(e)}), 500
@@ -189,7 +192,9 @@ def fail():
 
     rec = INFLIGHT.pop(lid)
     job = rec["job"]
-    JOBS_QUEUE.append(job)
+    
+    # [Auditor Fix] 실패한 작업은 큐에 다시 넣지 않고 폐기합니다.
+    # JOBS_QUEUE.append(job)  <-- 삭제됨
 
     svc, _ = _get_service()
     if svc:
@@ -198,7 +203,7 @@ def fail():
         except Exception as e:
             print("Update FAILED failed:", e)
 
-    return jsonify({"ok": True, "res": "Requeued"})
+    return jsonify({"ok": True, "res": "Marked as FAILED (Not Requeued)"})
 
 @app.route("/cookies", methods=["GET"])
 def cookies():
