@@ -11,10 +11,7 @@ app = Flask(__name__)
 # --- CONFIG ---
 GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
 GSHEET_TAB = os.getenv("GSHEET_TAB", "Sheet1").strip()
-
-# [Auditor Fix] 회장님이 만드신 시트 이름과 100% 일치시킴
-PRESETS_TAB = "EBAY_PRESETS" 
-
+EBAY_PRESETS_TAB = os.getenv("EBAY_PRESETS_TAB", "EBAY_PRESETS").strip()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 LEASE_SECONDS = 300
 
@@ -44,8 +41,7 @@ def to_a1(col0, row0):
         s = chr(65 + m) + s
     return f"{s}{row0 + 1}"
 
-def sheet_get_all(svc, tab_name):
-    # 탭 이름이 정확해야 읽을 수 있음
+def sheet_get_tab(svc, tab_name: str):
     return svc.spreadsheets().values().get(
         spreadsheetId=GSHEET_ID,
         range=f"{tab_name}!A1:ZZ"
@@ -73,53 +69,54 @@ def requeue_expired():
         rec = INFLIGHT.pop(lid)
         JOBS_QUEUE.append(rec["job"])
 
-def load_presets_if_needed(svc):
-    global PRESETS_CACHE, LAST_PRESET_LOAD
-    # 60초마다 갱신 (너무 자주 읽으면 구글이 차단함)
-    if now_ts() - LAST_PRESET_LOAD < 60 and PRESETS_CACHE:
-        return
-
-    try:
-        print(f"Reading Presets from: {PRESETS_TAB}")
-        resp = sheet_get_all(svc, PRESETS_TAB)
-        rows = resp.get("values", [])
-        if len(rows) < 2:
-            PRESETS_CACHE = []
-            return
-        
-        header = [str(h).strip().lower() for h in rows[0]]
-        temp_list = []
-        for r in rows[1:]:
-            item = {}
-            for i, val in enumerate(r):
-                if i < len(header):
-                    item[header[i]] = val
-            if str(item.get("active", "TRUE")).upper() in ["TRUE", "YES", "1", "ENABLED"]:
-                temp_list.append(item)
-        
-        PRESETS_CACHE = temp_list
-        LAST_PRESET_LOAD = now_ts()
-        print(f"Loaded {len(PRESETS_CACHE)} presets.")
-    except Exception as e:
-        print(f"Preset Load Failed ({PRESETS_TAB}):", e)
+def rows_to_dicts(values):
+    if not values or len(values) < 2: return []
+    header = [str(x).strip().lower() for x in values[0]]
+    out = []
+    for r in values[1:]:
+        d = {}
+        for i, h in enumerate(header):
+            d[h] = r[i] if i < len(r) else ""
+        out.append(d)
+    return out
 
 # --- ROUTES ---
 @app.route("/")
 def home():
-    return f"Empire Brain Online. Queue={len(JOBS_QUEUE)} Presets={len(PRESETS_CACHE)}"
+    return f"Empire Brain Online. Queue={len(JOBS_QUEUE)}"
 
 @app.route("/debug/google")
 def debug_google():
     svc, msg = _get_service()
     return jsonify({"ok": svc is not None, "msg": msg})
 
+@app.route("/presets/ebay", methods=["GET"])
+def presets_ebay():
+    """[Auditor] EBAY_PRESETS 시트를 읽어서 반환"""
+    svc, msg = _get_service()
+    if not svc: return jsonify({"ok": False, "error": "Auth Failed"}), 500
+    try:
+        resp = sheet_get_tab(svc, EBAY_PRESETS_TAB)
+        values = resp.get("values", [])
+        presets = rows_to_dicts(values)
+        
+        # enabled 필터
+        filtered = []
+        for p in presets:
+            enabled = str(p.get("enabled", "TRUE")).strip().upper()
+            if enabled in ("TRUE", "1", "YES", "Y"):
+                filtered.append(p)
+                
+        return jsonify({"ok": True, "count": len(filtered), "presets": filtered})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
 @app.route("/jobs/push-from-sheet", methods=["GET", "POST"])
 def push_from_sheet():
     svc, msg = _get_service()
     if not svc: return jsonify({"ok": False}), 500
     limit = int(request.args.get("limit", 20))
-    
-    try: resp = sheet_get_all(svc, GSHEET_TAB)
+    try: resp = sheet_get_tab(svc, GSHEET_TAB)
     except Exception as e: return jsonify({"ok": False, "err": str(e)}), 400
 
     rows = resp.get("values", [])
@@ -154,12 +151,6 @@ def lease():
         try: sheet_update_cell(svc, job["sheet_row"], job["sheet_status_col"], "INFLIGHT")
         except: pass
     return jsonify({"ok": True, "job": job, "lease_id": lid})
-
-@app.route("/presets", methods=["GET"])
-def get_presets():
-    svc, _ = _get_service()
-    if svc: load_presets_if_needed(svc)
-    return jsonify({"ok": True, "presets": PRESETS_CACHE})
 
 @app.route("/jobs/ack", methods=["POST"])
 def ack():
